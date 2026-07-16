@@ -783,7 +783,7 @@ fn read_stl(
         return Err("STL file contains no triangles".to_owned());
     }
 
-    let positions = mesh
+    let positions: Vec<[f32; 3]> = mesh
         .vertices
         .into_iter()
         .map(|vertex| {
@@ -798,11 +798,34 @@ fn read_stl(
         .map(|index| u32::try_from(index).map_err(|_| format!("vertex index {index} exceeds u32")))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let scale = compute_fit_scale(&positions);
+    let positions = positions
+        .into_iter()
+        .map(|pos| (Vec3::from_array(pos) * scale).to_array())
+        .collect();
+
     Ok(vec![ImportedMesh {
         name,
         positions,
         indices,
     }])
+}
+
+fn compute_fit_scale(positions: &[[f32; 3]]) -> f32 {
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for pos in positions {
+        let p = Vec3::from_array(*pos);
+        min = min.min(p);
+        max = max.max(p);
+    }
+    let extent = max - min;
+    let max_extent = extent.x.max(extent.y).max(extent.z);
+    if max_extent > 0.0 {
+        3.0 / max_extent
+    } else {
+        1.0
+    }
 }
 
 #[cfg(feature = "three-mf")]
@@ -1032,9 +1055,9 @@ mod tests {
         let meshes = read_stl(&mut reader, "triangle.stl".to_owned()).unwrap();
 
         let positions = &meshes[0].positions;
-        assert_eq!(positions[0], [0.0, 1.0, 0.0]);
-        assert_eq!(positions[1], [1.0, 1.0, 0.0]);
-        assert_eq!(positions[2], [0.0, 1.0, -1.0]);
+        assert_eq!(positions[0], [0.0, 3.0, 0.0]);
+        assert_eq!(positions[1], [3.0, 3.0, 0.0]);
+        assert_eq!(positions[2], [0.0, 3.0, -3.0]);
     }
 
     #[test]
