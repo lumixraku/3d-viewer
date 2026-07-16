@@ -29,6 +29,10 @@ Camera controls:
 - Right mouse drag: pan
 - Mouse wheel: zoom
 
+Opening or dropping a supported file replaces the current model immediately. The current file name is shown in the native window title.
+
+The viewer displays an editor-style ground grid. Imported GLB, GLTF, OBJ, and 3MF geometry is centered on the grid by its overall bounding box, placed on the ground plane, and automatically framed by the camera.
+
 ## Experimental 3MF Support
 
 ```bash

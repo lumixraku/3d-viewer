@@ -1,16 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 #[cfg(feature = "three-mf")]
 use bevy::{asset::RenderAssetUsages, mesh::Indices, render::render_resource::PrimitiveTopology};
 use bevy::{
-    asset::{AssetPath, AssetPlugin, UnapprovedPathMode},
+    asset::{AssetPath, AssetPlugin, LoadState, RecursiveDependencyLoadState, UnapprovedPathMode},
+    camera::{primitives::Aabb, visibility::VisibilitySystems},
+    dev_tools::infinite_grid::{InfiniteGrid, InfiniteGridPlugin, InfiniteGridSettings},
     gltf::GltfAssetLabel,
     prelude::*,
     tasks::{
         AsyncComputeTaskPool, Task,
         futures_lite::future::{block_on, poll_once},
     },
-    window::FileDragAndDrop,
+    transform::TransformSystems,
+    window::{FileDragAndDrop, PrimaryWindow},
+    world_serialization::WorldInstanceReady,
 };
 use bevy_obj::ObjPlugin;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
@@ -20,17 +27,80 @@ use rfd::AsyncFileDialog;
 struct LoadedModel;
 
 #[derive(Component)]
+struct ModelGeneration(u64);
+
+#[derive(Resource, Default)]
+struct ModelRequest {
+    generation: u64,
+    file_name: Option<String>,
+    status: LoadingStatus,
+    started_at: Option<Instant>,
+    stage: LoadingStage,
+}
+
+#[derive(Component)]
+struct LoadingPanel;
+
+#[derive(Component)]
+struct LoadingText;
+
+#[derive(Default, PartialEq, Eq)]
+enum LoadingStatus {
+    #[default]
+    Idle,
+    Loading,
+    Failed,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum LoadingStage {
+    #[default]
+    LoadingAsset,
+    SpawningScene,
+    FramingModel,
+}
+
+#[derive(Component)]
+struct PendingModelNormalization;
+
+type PendingModelRoot = (
+    With<WorldAssetRoot>,
+    With<LoadedModel>,
+    With<PendingModelNormalization>,
+);
+
+#[derive(Component)]
 struct PickFileTask(Task<Option<PathBuf>>);
+
+#[derive(Component)]
+struct Pending3mfImport;
 
 #[cfg(feature = "three-mf")]
 #[derive(Component)]
-struct Import3mfTask(Task<Result<Vec<ImportedMesh>, String>>);
+struct Import3mfTask {
+    generation: u64,
+    task: Task<Result<Vec<ImportedMesh>, String>>,
+}
 
 #[cfg(feature = "three-mf")]
 struct ImportedMesh {
     name: String,
     positions: Vec<[f32; 3]>,
     indices: Vec<u32>,
+}
+
+#[cfg(feature = "three-mf")]
+#[derive(Clone, Copy)]
+struct ModelBounds {
+    min: Vec3,
+    max: Vec3,
+}
+
+#[cfg(feature = "three-mf")]
+impl ModelBounds {
+    fn center(self) -> Vec3 {
+        (self.min + self.max) * 0.5
+    }
 }
 
 fn main() {
@@ -41,12 +111,37 @@ fn main() {
         }))
         .add_plugins(ObjPlugin)
         .add_plugins(PanOrbitCameraPlugin)
-        .add_systems(Startup, (setup, load_startup_model))
+        .add_plugins(InfiniteGridPlugin)
+        .init_resource::<ModelRequest>()
+        .add_systems(Startup, setup)
+        .add_systems(PostStartup, load_startup_model)
+        .add_observer(mark_model_ready)
         .add_systems(
             Update,
-            (open_file_dialog, poll_file_dialog, handle_file_drop),
+            (
+                open_file_dialog,
+                poll_file_dialog,
+                handle_file_drop,
+                detect_asset_load_failures,
+                poll_3mf_import.run_if(feature_enabled_3mf),
+                sync_window_title_and_loading_ui,
+            )
+                .chain(),
         )
-        .add_systems(Update, poll_3mf_import.run_if(feature_enabled_3mf))
+        .add_systems(
+            PostStartup,
+            sync_window_title_and_loading_ui.after(load_startup_model),
+        )
+        .add_systems(
+            PostUpdate,
+            (
+                discard_stale_models,
+                normalize_pending_models
+                    .after(discard_stale_models)
+                    .after(TransformSystems::Propagate)
+                    .after(VisibilitySystems::CalculateBounds),
+            ),
+        )
         .run();
 }
 
@@ -75,14 +170,320 @@ fn setup(mut commands: Commands) {
         brightness: 100.0,
         ..default()
     });
+
+    commands.spawn((
+        InfiniteGrid,
+        InfiniteGridSettings {
+            x_axis_color: Color::srgb(0.78, 0.22, 0.22),
+            z_axis_color: Color::srgb(0.22, 0.42, 0.82),
+            minor_line_color: Color::srgba(0.28, 0.30, 0.34, 0.55),
+            major_line_color: Color::srgba(0.52, 0.54, 0.58, 0.78),
+            fadeout_distance: 100.0,
+            dot_fadeout_strength: 0.25,
+            scale: 1.0,
+        },
+    ));
+
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                width: percent(100),
+                height: percent(100),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            Visibility::Hidden,
+            LoadingPanel,
+        ))
+        .with_children(|parent| {
+            parent
+                .spawn((
+                    Node {
+                        padding: UiRect::axes(px(28), px(18)),
+                        border_radius: BorderRadius::all(px(12)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.04, 0.05, 0.07, 0.88)),
+                ))
+                .with_child((
+                    Text::new("Loading…"),
+                    TextFont {
+                        font_size: FontSize::Px(22.0),
+                        ..default()
+                    },
+                    TextColor(Color::WHITE),
+                    LoadingText,
+                ));
+        });
 }
 
-fn load_startup_model(mut commands: Commands, asset_server: Res<AssetServer>) {
+fn sync_window_title_and_loading_ui(
+    request: Res<ModelRequest>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut panels: Query<&mut Visibility, With<LoadingPanel>>,
+    mut texts: Query<&mut Text, With<LoadingText>>,
+) {
+    if !request.is_changed() {
+        return;
+    }
+
+    if let Ok(mut window) = windows.single_mut() {
+        window.title = request.file_name.as_ref().map_or_else(
+            || "rust-model-viewer".to_owned(),
+            |file_name| format!("rust-model-viewer - {file_name}"),
+        );
+    }
+
+    if let Ok(mut panel) = panels.single_mut() {
+        *panel = if request.status == LoadingStatus::Idle {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+    }
+
+    if let Ok(mut text) = texts.single_mut() {
+        text.0 = match request.status {
+            LoadingStatus::Idle => String::new(),
+            LoadingStatus::Loading => match request.stage {
+                LoadingStage::LoadingAsset => "Loading model…".to_owned(),
+                LoadingStage::SpawningScene => "Preparing scene…".to_owned(),
+                LoadingStage::FramingModel => "Framing model…".to_owned(),
+            },
+            LoadingStatus::Failed => "Failed to load".to_owned(),
+        };
+    }
+}
+
+fn detect_asset_load_failures(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut request: ResMut<ModelRequest>,
+    models: Query<(Entity, &WorldAssetRoot, &ModelGeneration), With<LoadedModel>>,
+) {
+    if request.status != LoadingStatus::Loading {
+        return;
+    }
+
+    for (entity, world_root, generation) in &models {
+        if generation.0 != request.generation {
+            continue;
+        }
+
+        if let Some((load_state, _, recursive_state)) = asset_server.get_load_states(&world_root.0)
+        {
+            let fully_loaded = matches!(load_state, LoadState::Loaded)
+                && matches!(recursive_state, RecursiveDependencyLoadState::Loaded);
+            let failure = match (load_state, recursive_state) {
+                (LoadState::Failed(error), _) => Some(error),
+                (_, RecursiveDependencyLoadState::Failed(error)) => Some(error),
+                _ => None,
+            };
+
+            if let Some(error) = failure {
+                error!("Failed to load model generation {}: {error}", generation.0);
+                request.status = LoadingStatus::Failed;
+                commands.entity(entity).despawn();
+            } else if fully_loaded && request.stage == LoadingStage::LoadingAsset {
+                request.stage = LoadingStage::SpawningScene;
+                if let Some(started_at) = request.started_at {
+                    info!(
+                        "Asset and dependencies loaded: generation={}, elapsed_ms={}",
+                        generation.0,
+                        started_at.elapsed().as_millis()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "three-mf")]
+fn fail_current_request(request: &mut ModelRequest, generation: u64, reason: &str) {
+    if request.generation != generation {
+        return;
+    }
+
+    error!("Failed to load model generation {generation}: {reason}");
+    request.status = LoadingStatus::Failed;
+}
+
+fn complete_current_request(request: &mut ModelRequest, generation: u64) {
+    if request.generation == generation {
+        if let Some(started_at) = request.started_at.take() {
+            info!(
+                "Model request complete: generation={generation}, total_ms={}",
+                started_at.elapsed().as_millis()
+            );
+        }
+        request.status = LoadingStatus::Idle;
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn log_accepted_request(path: &Path, generation: u64) {
+    info!(
+        "Accepted model request: path={}, generation={generation}",
+        path.display()
+    );
+}
+
+fn log_scene_ready(path: Option<&str>, generation: u64) {
+    info!(
+        "Scene ready and normalized: file={}, generation={generation}",
+        path.unwrap_or("<unknown>")
+    );
+}
+
+#[cfg(feature = "three-mf")]
+fn log_3mf_imported(path: Option<&str>, generation: u64) {
+    info!(
+        "3MF imported and normalized: file={}, generation={generation}",
+        path.unwrap_or("<unknown>")
+    );
+}
+
+fn load_startup_model(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut request: ResMut<ModelRequest>,
+    loaded_models: Query<Entity, With<LoadedModel>>,
+    import_tasks: Query<Entity, With<Pending3mfImport>>,
+) {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
         return;
     };
 
-    load_model(&mut commands, &asset_server, &path);
+    load_model(
+        &mut commands,
+        &asset_server,
+        &path,
+        &mut request,
+        &loaded_models,
+        &import_tasks,
+    );
+}
+
+fn mark_model_ready(
+    ready: On<WorldInstanceReady>,
+    mut commands: Commands,
+    roots: Query<(), (With<LoadedModel>, With<WorldAssetRoot>)>,
+    mut request: ResMut<ModelRequest>,
+) {
+    if roots.get(ready.entity).is_ok() {
+        request.stage = LoadingStage::FramingModel;
+        if let Some(started_at) = request.started_at {
+            info!(
+                "Scene instantiated: generation={}, elapsed_ms={}",
+                request.generation,
+                started_at.elapsed().as_millis()
+            );
+        }
+        commands
+            .entity(ready.entity)
+            .insert(PendingModelNormalization);
+    }
+}
+
+fn discard_stale_models(
+    mut commands: Commands,
+    request: Res<ModelRequest>,
+    models: Query<(Entity, &ModelGeneration), With<LoadedModel>>,
+) {
+    for (entity, generation) in &models {
+        if generation.0 != request.generation {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+fn normalize_pending_models(
+    mut commands: Commands,
+    mut request: ResMut<ModelRequest>,
+    mut roots: Query<(Entity, &ModelGeneration, &mut Transform), PendingModelRoot>,
+    children: Query<&Children>,
+    mesh_entities: Query<(), With<Mesh3d>>,
+    bounds: Query<(&Aabb, &GlobalTransform)>,
+    mut cameras: Query<(&Projection, &mut PanOrbitCamera), With<Camera3d>>,
+) {
+    for (root, generation, mut root_transform) in &mut roots {
+        if generation.0 != request.generation {
+            commands.entity(root).despawn();
+            continue;
+        }
+
+        let Some((min, max)) = compute_world_aabb(root, &children, &mesh_entities, &bounds) else {
+            continue;
+        };
+
+        let center = (min + max) * 0.5;
+        let offset = Vec3::new(-center.x, -min.y, -center.z);
+        root_transform.translation += offset;
+
+        let normalized_min = min + offset;
+        let normalized_max = max + offset;
+        let normalized_center = center + offset;
+
+        if let Ok((projection, mut camera)) = cameras.single_mut() {
+            frame_camera_from_aabb(
+                normalized_min,
+                normalized_max,
+                normalized_center,
+                projection,
+                &mut camera,
+            );
+        }
+
+        commands.entity(root).remove::<PendingModelNormalization>();
+        complete_current_request(&mut request, generation.0);
+        log_scene_ready(request.file_name.as_deref(), generation.0);
+    }
+}
+
+fn compute_world_aabb(
+    root: Entity,
+    children: &Query<&Children>,
+    mesh_entities: &Query<(), With<Mesh3d>>,
+    bounds: &Query<(&Aabb, &GlobalTransform)>,
+) -> Option<(Vec3, Vec3)> {
+    let entities = std::iter::once(root).chain(children.iter_descendants(root));
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    let mut saw_mesh = false;
+
+    for entity in entities {
+        if mesh_entities.get(entity).is_err() {
+            continue;
+        }
+        saw_mesh = true;
+
+        let Ok((aabb, global_transform)) = bounds.get(entity) else {
+            return None;
+        };
+
+        let center: Vec3 = aabb.center.into();
+        let half_extents: Vec3 = aabb.half_extents.into();
+        for sx in [-1.0, 1.0] {
+            for sy in [-1.0, 1.0] {
+                for sz in [-1.0, 1.0] {
+                    let local_corner = center + half_extents * Vec3::new(sx, sy, sz);
+                    let world_corner = global_transform.to_matrix().transform_point3(local_corner);
+                    min = min.min(world_corner);
+                    max = max.max(world_corner);
+                }
+            }
+        }
+    }
+
+    (saw_mesh && min.is_finite() && max.is_finite()).then_some((min, max))
 }
 
 fn open_file_dialog(
@@ -121,7 +522,10 @@ fn supported_extensions() -> &'static [&'static str] {
 fn poll_file_dialog(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut request: ResMut<ModelRequest>,
     mut tasks: Query<(Entity, &mut PickFileTask)>,
+    loaded_models: Query<Entity, With<LoadedModel>>,
+    import_tasks: Query<Entity, With<Pending3mfImport>>,
 ) {
     for (entity, mut task) in &mut tasks {
         let Some(result) = block_on(poll_once(&mut task.0)) else {
@@ -131,7 +535,14 @@ fn poll_file_dialog(
         commands.entity(entity).despawn();
 
         if let Some(path) = result {
-            load_model(&mut commands, &asset_server, &path);
+            load_model(
+                &mut commands,
+                &asset_server,
+                &path,
+                &mut request,
+                &loaded_models,
+                &import_tasks,
+            );
         }
     }
 }
@@ -140,17 +551,34 @@ fn handle_file_drop(
     mut messages: MessageReader<FileDragAndDrop>,
     mut commands: Commands,
     asset_server: Res<AssetServer>,
+    mut request: ResMut<ModelRequest>,
+    loaded_models: Query<Entity, With<LoadedModel>>,
+    import_tasks: Query<Entity, With<Pending3mfImport>>,
 ) {
     for message in messages.read() {
         let FileDragAndDrop::DroppedFile { path_buf, .. } = message else {
             continue;
         };
 
-        load_model(&mut commands, &asset_server, path_buf);
+        load_model(
+            &mut commands,
+            &asset_server,
+            path_buf,
+            &mut request,
+            &loaded_models,
+            &import_tasks,
+        );
     }
 }
 
-fn load_model(commands: &mut Commands, asset_server: &AssetServer, path: &Path) {
+fn load_model(
+    commands: &mut Commands,
+    asset_server: &AssetServer,
+    path: &Path,
+    request: &mut ModelRequest,
+    loaded_models: &Query<Entity, With<LoadedModel>>,
+    import_tasks: &Query<Entity, With<Pending3mfImport>>,
+) {
     let Some(extension) = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -160,24 +588,52 @@ fn load_model(commands: &mut Commands, asset_server: &AssetServer, path: &Path) 
         return;
     };
 
+    if !supported_extensions().contains(&extension.as_str()) {
+        warn!("Unsupported file type: {}", path.display());
+        return;
+    }
+
+    request.generation = request.generation.wrapping_add(1);
+    let generation = request.generation;
+    request.file_name = Some(file_name(path));
+    request.status = LoadingStatus::Loading;
+    request.started_at = Some(Instant::now());
+    request.stage = LoadingStage::LoadingAsset;
+    log_accepted_request(path, generation);
+
+    for entity in loaded_models.iter() {
+        commands.entity(entity).despawn();
+    }
+    for entity in import_tasks.iter() {
+        commands.entity(entity).despawn();
+    }
+
     let asset_path = AssetPath::from_path_buf(path.to_owned());
 
     match extension.as_str() {
         "glb" | "gltf" => {
             let scene = asset_server.load(GltfAssetLabel::Scene(0).from_asset(asset_path));
-            commands.spawn((WorldAssetRoot(scene), LoadedModel));
+            commands.spawn((
+                WorldAssetRoot(scene),
+                LoadedModel,
+                ModelGeneration(generation),
+            ));
         }
         "obj" => {
             let scene = asset_server.load(asset_path);
-            commands.spawn((WorldAssetRoot(scene), LoadedModel));
+            commands.spawn((
+                WorldAssetRoot(scene),
+                LoadedModel,
+                ModelGeneration(generation),
+            ));
         }
         #[cfg(feature = "three-mf")]
         "3mf" => {
             let path = path.to_owned();
             let task = AsyncComputeTaskPool::get().spawn(async move { import_3mf(&path) });
-            commands.spawn(Import3mfTask(task));
+            commands.spawn((Pending3mfImport, Import3mfTask { generation, task }));
         }
-        _ => warn!("Unsupported file type: {}", path.display()),
+        _ => unreachable!("supported extension was checked above"),
     }
 }
 
@@ -186,40 +642,130 @@ fn poll_3mf_import(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut request: ResMut<ModelRequest>,
+    mut cameras: Query<(&Projection, &mut PanOrbitCamera), With<Camera3d>>,
     mut tasks: Query<(Entity, &mut Import3mfTask)>,
 ) {
     for (entity, mut task) in &mut tasks {
-        let Some(result) = block_on(poll_once(&mut task.0)) else {
+        let generation = task.generation;
+        let Some(result) = block_on(poll_once(&mut task.task)) else {
             continue;
         };
 
         commands.entity(entity).despawn();
 
+        if generation != request.generation {
+            continue;
+        }
+
         match result {
-            Ok(imported_meshes) => {
+            Ok(mut imported_meshes) => {
+                let Some(bounds) = normalize_imported_meshes(&mut imported_meshes) else {
+                    fail_current_request(&mut request, generation, "3MF contains no vertices");
+                    continue;
+                };
+
+                if let Ok((projection, mut camera)) = cameras.single_mut() {
+                    frame_camera_from_aabb(
+                        bounds.min,
+                        bounds.max,
+                        bounds.center(),
+                        projection,
+                        &mut camera,
+                    );
+                }
+
                 let material = materials.add(StandardMaterial {
                     base_color: Color::srgb(0.72, 0.74, 0.78),
                     perceptual_roughness: 0.65,
                     ..default()
                 });
 
-                for imported in imported_meshes {
-                    match make_mesh(imported.positions, imported.indices) {
-                        Ok(mesh) => {
-                            commands.spawn((
-                                Name::new(imported.name),
-                                Mesh3d(meshes.add(mesh)),
-                                MeshMaterial3d(material.clone()),
-                                LoadedModel,
-                            ));
-                        }
-                        Err(error) => error!("Failed to create 3MF mesh: {error}"),
+                let imported_meshes = imported_meshes
+                    .into_iter()
+                    .map(|imported| {
+                        make_mesh(imported.positions, imported.indices)
+                            .map(|mesh| (imported.name, mesh))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let imported_meshes = match imported_meshes {
+                    Ok(imported_meshes) => imported_meshes,
+                    Err(error) => {
+                        fail_current_request(&mut request, generation, &error);
+                        continue;
                     }
+                };
+
+                for (name, mesh) in imported_meshes {
+                    commands.spawn((
+                        Name::new(name),
+                        Mesh3d(meshes.add(mesh)),
+                        MeshMaterial3d(material.clone()),
+                        LoadedModel,
+                        ModelGeneration(generation),
+                    ));
                 }
+
+                complete_current_request(&mut request, generation);
+                log_3mf_imported(request.file_name.as_deref(), generation);
             }
-            Err(error) => error!("Failed to import 3MF: {error}"),
+            Err(error) => fail_current_request(&mut request, generation, &error),
         }
     }
+}
+
+#[cfg(feature = "three-mf")]
+fn normalize_imported_meshes(meshes: &mut [ImportedMesh]) -> Option<ModelBounds> {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+
+    for mesh in meshes.iter() {
+        for position in &mesh.positions {
+            let position = Vec3::from_array(*position);
+            min = min.min(position);
+            max = max.max(position);
+        }
+    }
+
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+
+    let offset = Vec3::new(-(min.x + max.x) * 0.5, -min.y, -(min.z + max.z) * 0.5);
+    for mesh in meshes {
+        for position in &mut mesh.positions {
+            let normalized = Vec3::from_array(*position) + offset;
+            *position = normalized.to_array();
+        }
+    }
+
+    Some(ModelBounds {
+        min: min + offset,
+        max: max + offset,
+    })
+}
+
+fn frame_camera_from_aabb(
+    min: Vec3,
+    max: Vec3,
+    center: Vec3,
+    projection: &Projection,
+    camera: &mut PanOrbitCamera,
+) {
+    let half_extents = (max - min) * 0.5;
+    let sphere_radius = half_extents.length().max(0.1);
+    let radius = match projection {
+        Projection::Perspective(perspective) => {
+            let vertical_half_fov = perspective.fov * 0.5;
+            let horizontal_half_fov = (vertical_half_fov.tan() * perspective.aspect_ratio).atan();
+            let limiting_half_fov = vertical_half_fov.min(horizontal_half_fov);
+            (sphere_radius / limiting_half_fov.sin() * 1.15).max(0.1)
+        }
+        _ => (sphere_radius * 2.0).max(0.1),
+    };
+
+    camera.target_focus = center;
+    camera.target_radius = radius;
 }
 
 #[cfg(not(feature = "three-mf"))]
@@ -426,5 +972,31 @@ mod tests {
         let error = make_mesh(vec![[0.0, 0.0, 0.0]], vec![0, 1, 0]).unwrap_err();
 
         assert!(error.contains("exceeds vertex count"));
+    }
+
+    #[test]
+    fn centers_all_meshes_and_places_them_on_the_ground() {
+        let mut meshes = vec![
+            ImportedMesh {
+                name: "left".to_owned(),
+                positions: vec![[-4.0, 2.0, -1.0], [-2.0, 4.0, 1.0]],
+                indices: vec![],
+            },
+            ImportedMesh {
+                name: "right".to_owned(),
+                positions: vec![[2.0, 3.0, 3.0], [6.0, 8.0, 5.0]],
+                indices: vec![],
+            },
+        ];
+        let separation_before =
+            Vec3::from_array(meshes[1].positions[0]) - Vec3::from_array(meshes[0].positions[0]);
+
+        let bounds = normalize_imported_meshes(&mut meshes).unwrap();
+        let separation_after =
+            Vec3::from_array(meshes[1].positions[0]) - Vec3::from_array(meshes[0].positions[0]);
+
+        assert_eq!(bounds.min, Vec3::new(-5.0, 0.0, -3.0));
+        assert_eq!(bounds.max, Vec3::new(5.0, 6.0, 3.0));
+        assert_eq!(separation_before, separation_after);
     }
 }
