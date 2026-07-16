@@ -8,6 +8,7 @@ A small native model viewer built mostly from existing Rust crates instead of a 
 - `bevy_obj`: OBJ loading
 - `bevy_panorbit_camera`: orbit, pan, and zoom controls
 - `rfd`: native file picker
+- `stl_io`: ASCII and binary STL parsing
 - `threemf`: optional 3MF package parsing
 
 ## Run
@@ -16,7 +17,7 @@ A small native model viewer built mostly from existing Rust crates instead of a 
 cargo run
 ```
 
-Open a GLB, GLTF, or OBJ by dropping it into the window or pressing `O`.
+Open a GLB, GLTF, OBJ, or STL by dropping it into the window or pressing `O`.
 You can also pass a model path when starting the viewer:
 
 ```bash
@@ -31,7 +32,7 @@ Camera controls:
 
 Opening or dropping a supported file replaces the current model immediately. The current file name is shown in the native window title.
 
-The viewer displays an editor-style ground grid. Imported GLB, GLTF, OBJ, and 3MF geometry is centered on the grid by its overall bounding box, placed on the ground plane, and automatically framed by the camera.
+The viewer displays an editor-style ground grid. Imported GLB, GLTF, OBJ, STL, and 3MF geometry is centered on the grid by its overall bounding box, placed on the ground plane, and automatically framed by the camera.
 
 ## Experimental 3MF Support
 

@@ -3,7 +3,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "three-mf")]
 use bevy::{asset::RenderAssetUsages, mesh::Indices, render::render_resource::PrimitiveTopology};
 use bevy::{
     asset::{AssetPath, AssetPlugin, LoadState, RecursiveDependencyLoadState, UnapprovedPathMode},
@@ -73,30 +72,26 @@ type PendingModelRoot = (
 struct PickFileTask(Task<Option<PathBuf>>);
 
 #[derive(Component)]
-struct Pending3mfImport;
+struct PendingMeshImport;
 
-#[cfg(feature = "three-mf")]
 #[derive(Component)]
-struct Import3mfTask {
+struct ImportMeshTask {
     generation: u64,
     task: Task<Result<Vec<ImportedMesh>, String>>,
 }
 
-#[cfg(feature = "three-mf")]
 struct ImportedMesh {
     name: String,
     positions: Vec<[f32; 3]>,
     indices: Vec<u32>,
 }
 
-#[cfg(feature = "three-mf")]
 #[derive(Clone, Copy)]
 struct ModelBounds {
     min: Vec3,
     max: Vec3,
 }
 
-#[cfg(feature = "three-mf")]
 impl ModelBounds {
     fn center(self) -> Vec3 {
         (self.min + self.max) * 0.5
@@ -123,7 +118,7 @@ fn main() {
                 poll_file_dialog,
                 handle_file_drop,
                 detect_asset_load_failures,
-                poll_3mf_import.run_if(feature_enabled_3mf),
+                poll_mesh_import,
                 sync_window_title_and_loading_ui,
             )
                 .chain(),
@@ -145,10 +140,6 @@ fn main() {
         .run();
 }
 
-fn feature_enabled_3mf() -> bool {
-    cfg!(feature = "three-mf")
-}
-
 fn setup(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
@@ -158,16 +149,25 @@ fn setup(mut commands: Commands) {
 
     commands.spawn((
         DirectionalLight {
-            illuminance: 10_000.0,
+            illuminance: 25_000.0,
             shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_xyz(3.0, 5.0, 3.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 12_000.0,
+            shadow_maps_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-2.0, 4.0, -2.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::WHITE,
-        brightness: 100.0,
+        color: Color::srgb(0.92, 0.94, 1.0),
+        brightness: 1500.0,
         ..default()
     });
 
@@ -178,7 +178,7 @@ fn setup(mut commands: Commands) {
             z_axis_color: Color::srgb(0.22, 0.42, 0.82),
             minor_line_color: Color::srgba(0.28, 0.30, 0.34, 0.55),
             major_line_color: Color::srgba(0.52, 0.54, 0.58, 0.78),
-            fadeout_distance: 100.0,
+            fadeout_distance: 10_000.0,
             dot_fadeout_strength: 0.25,
             scale: 1.0,
         },
@@ -300,7 +300,6 @@ fn detect_asset_load_failures(
     }
 }
 
-#[cfg(feature = "three-mf")]
 fn fail_current_request(request: &mut ModelRequest, generation: u64, reason: &str) {
     if request.generation != generation {
         return;
@@ -343,10 +342,9 @@ fn log_scene_ready(path: Option<&str>, generation: u64) {
     );
 }
 
-#[cfg(feature = "three-mf")]
-fn log_3mf_imported(path: Option<&str>, generation: u64) {
+fn log_mesh_imported(path: Option<&str>, generation: u64) {
     info!(
-        "3MF imported and normalized: file={}, generation={generation}",
+        "Mesh imported and normalized: file={}, generation={generation}",
         path.unwrap_or("<unknown>")
     );
 }
@@ -356,7 +354,7 @@ fn load_startup_model(
     asset_server: Res<AssetServer>,
     mut request: ResMut<ModelRequest>,
     loaded_models: Query<Entity, With<LoadedModel>>,
-    import_tasks: Query<Entity, With<Pending3mfImport>>,
+    import_tasks: Query<Entity, With<PendingMeshImport>>,
 ) {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
         return;
@@ -510,12 +508,12 @@ fn open_file_dialog(
 fn supported_extensions() -> &'static [&'static str] {
     #[cfg(feature = "three-mf")]
     {
-        &["glb", "gltf", "obj", "3mf"]
+        &["glb", "gltf", "obj", "stl", "3mf"]
     }
 
     #[cfg(not(feature = "three-mf"))]
     {
-        &["glb", "gltf", "obj"]
+        &["glb", "gltf", "obj", "stl"]
     }
 }
 
@@ -525,7 +523,7 @@ fn poll_file_dialog(
     mut request: ResMut<ModelRequest>,
     mut tasks: Query<(Entity, &mut PickFileTask)>,
     loaded_models: Query<Entity, With<LoadedModel>>,
-    import_tasks: Query<Entity, With<Pending3mfImport>>,
+    import_tasks: Query<Entity, With<PendingMeshImport>>,
 ) {
     for (entity, mut task) in &mut tasks {
         let Some(result) = block_on(poll_once(&mut task.0)) else {
@@ -553,7 +551,7 @@ fn handle_file_drop(
     asset_server: Res<AssetServer>,
     mut request: ResMut<ModelRequest>,
     loaded_models: Query<Entity, With<LoadedModel>>,
-    import_tasks: Query<Entity, With<Pending3mfImport>>,
+    import_tasks: Query<Entity, With<PendingMeshImport>>,
 ) {
     for message in messages.read() {
         let FileDragAndDrop::DroppedFile { path_buf, .. } = message else {
@@ -577,7 +575,7 @@ fn load_model(
     path: &Path,
     request: &mut ModelRequest,
     loaded_models: &Query<Entity, With<LoadedModel>>,
-    import_tasks: &Query<Entity, With<Pending3mfImport>>,
+    import_tasks: &Query<Entity, With<PendingMeshImport>>,
 ) {
     let Some(extension) = path
         .extension()
@@ -627,24 +625,28 @@ fn load_model(
                 ModelGeneration(generation),
             ));
         }
+        "stl" => {
+            let path = path.to_owned();
+            let task = AsyncComputeTaskPool::get().spawn(async move { import_stl(&path) });
+            commands.spawn((PendingMeshImport, ImportMeshTask { generation, task }));
+        }
         #[cfg(feature = "three-mf")]
         "3mf" => {
             let path = path.to_owned();
             let task = AsyncComputeTaskPool::get().spawn(async move { import_3mf(&path) });
-            commands.spawn((Pending3mfImport, Import3mfTask { generation, task }));
+            commands.spawn((PendingMeshImport, ImportMeshTask { generation, task }));
         }
         _ => unreachable!("supported extension was checked above"),
     }
 }
 
-#[cfg(feature = "three-mf")]
-fn poll_3mf_import(
+fn poll_mesh_import(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut request: ResMut<ModelRequest>,
     mut cameras: Query<(&Projection, &mut PanOrbitCamera), With<Camera3d>>,
-    mut tasks: Query<(Entity, &mut Import3mfTask)>,
+    mut tasks: Query<(Entity, &mut ImportMeshTask)>,
 ) {
     for (entity, mut task) in &mut tasks {
         let generation = task.generation;
@@ -661,7 +663,7 @@ fn poll_3mf_import(
         match result {
             Ok(mut imported_meshes) => {
                 let Some(bounds) = normalize_imported_meshes(&mut imported_meshes) else {
-                    fail_current_request(&mut request, generation, "3MF contains no vertices");
+                    fail_current_request(&mut request, generation, "model contains no vertices");
                     continue;
                 };
 
@@ -707,14 +709,13 @@ fn poll_3mf_import(
                 }
 
                 complete_current_request(&mut request, generation);
-                log_3mf_imported(request.file_name.as_deref(), generation);
+                log_mesh_imported(request.file_name.as_deref(), generation);
             }
             Err(error) => fail_current_request(&mut request, generation, &error),
         }
     }
 }
 
-#[cfg(feature = "three-mf")]
 fn normalize_imported_meshes(meshes: &mut [ImportedMesh]) -> Option<ModelBounds> {
     let mut min = Vec3::splat(f32::INFINITY);
     let mut max = Vec3::splat(f32::NEG_INFINITY);
@@ -768,8 +769,41 @@ fn frame_camera_from_aabb(
     camera.target_radius = radius;
 }
 
-#[cfg(not(feature = "three-mf"))]
-fn poll_3mf_import() {}
+fn import_stl(path: &Path) -> Result<Vec<ImportedMesh>, String> {
+    let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    read_stl(&mut file, file_name(path))
+}
+
+fn read_stl(
+    reader: &mut (impl std::io::Read + std::io::Seek),
+    name: String,
+) -> Result<Vec<ImportedMesh>, String> {
+    let mesh = stl_io::read_stl(reader).map_err(|error| error.to_string())?;
+    if mesh.vertices.is_empty() || mesh.faces.is_empty() {
+        return Err("STL file contains no triangles".to_owned());
+    }
+
+    let positions = mesh
+        .vertices
+        .into_iter()
+        .map(|vertex| {
+            let [x, y, z] = vertex.0;
+            [x, z, -y]
+        })
+        .collect();
+    let indices = mesh
+        .faces
+        .into_iter()
+        .flat_map(|face| face.vertices)
+        .map(|index| u32::try_from(index).map_err(|_| format!("vertex index {index} exceeds u32")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(vec![ImportedMesh {
+        name,
+        positions,
+        indices,
+    }])
+}
 
 #[cfg(feature = "three-mf")]
 fn import_3mf(path: &Path) -> Result<Vec<ImportedMesh>, String> {
@@ -914,7 +948,6 @@ fn compose_3mf_transforms(parent: [f64; 12], child: [f64; 12]) -> [f64; 12] {
     result
 }
 
-#[cfg(feature = "three-mf")]
 fn make_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Result<Mesh, String> {
     if !indices.len().is_multiple_of(3) {
         return Err("triangle index count is not divisible by 3".to_owned());
@@ -939,10 +972,78 @@ fn make_mesh(positions: Vec<[f32; 3]>, indices: Vec<u32>) -> Result<Mesh, String
     Ok(mesh)
 }
 
-#[cfg(all(test, feature = "three-mf"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn imports_ascii_stl() {
+        let source = b"solid triangle\n\
+            facet normal 0 0 1\n\
+              outer loop\n\
+                vertex 0 0 0\n\
+                vertex 1 0 0\n\
+                vertex 0 1 0\n\
+              endloop\n\
+            endfacet\n\
+            endsolid triangle\n";
+        let mut reader = std::io::Cursor::new(source);
+
+        let meshes = read_stl(&mut reader, "triangle.stl".to_owned()).unwrap();
+
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].name, "triangle.stl");
+        assert_eq!(meshes[0].positions.len(), 3);
+        assert_eq!(meshes[0].indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn imports_binary_stl() {
+        let mut source = vec![0; 80];
+        source.extend_from_slice(&1_u32.to_le_bytes());
+        for value in [
+            0.0_f32, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ] {
+            source.extend_from_slice(&value.to_le_bytes());
+        }
+        source.extend_from_slice(&0_u16.to_le_bytes());
+        let mut reader = std::io::Cursor::new(source);
+
+        let meshes = read_stl(&mut reader, "triangle.stl".to_owned()).unwrap();
+
+        assert_eq!(meshes.len(), 1);
+        assert_eq!(meshes[0].positions.len(), 3);
+        assert_eq!(meshes[0].indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn converts_stl_z_up_to_bevy_y_up() {
+        let source = b"solid triangle\n\
+            facet normal 0 0 1\n\
+              outer loop\n\
+                vertex 0 0 1\n\
+                vertex 1 0 1\n\
+                vertex 0 1 1\n\
+              endloop\n\
+            endfacet\n\
+            endsolid triangle\n";
+        let mut reader = std::io::Cursor::new(source);
+
+        let meshes = read_stl(&mut reader, "triangle.stl".to_owned()).unwrap();
+
+        let positions = &meshes[0].positions;
+        assert_eq!(positions[0], [0.0, 1.0, 0.0]);
+        assert_eq!(positions[1], [1.0, 1.0, 0.0]);
+        assert_eq!(positions[2], [0.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn rejects_empty_stl() {
+        let mut reader = std::io::Cursor::new(b"");
+        assert!(read_stl(&mut reader, "empty.stl".to_owned()).is_err());
+    }
+
+    #[cfg(feature = "three-mf")]
     #[test]
     fn transforms_points_using_3mf_column_vectors() {
         let transform = [
@@ -955,6 +1056,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "three-mf")]
     #[test]
     fn composes_parent_and_child_transforms() {
         let parent = [0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 10.0, 0.0, 0.0];
