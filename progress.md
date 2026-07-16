@@ -6,6 +6,9 @@
 - `compute_fit_scale` auto-scales imported STL vertices so the model's largest bounding-box dimension becomes 3.0 Bevy units.
 - Fixes models appearing 1000× too large (mm treated as m) and grid moiré caused by extreme scale mismatch.
 - Updated `converts_stl_z_up_to_bevy_y_up` test for scaled coordinate output.
+- Added screenshot to README.
+
+## 759ee20 — Add STL support, fix coordinate system, improve lighting and grid
 
 ## 759ee20 — Add STL support, fix coordinate system, improve lighting and grid
 

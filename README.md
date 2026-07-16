@@ -2,6 +2,8 @@
 
 A small native model viewer built mostly from existing Rust crates instead of a custom renderer.
 
+![](screenshot.png)
+
 ## Stack
 
 - `bevy`: scene, PBR rendering, GLB/GLTF loading, lighting, and the `wgpu` backend
