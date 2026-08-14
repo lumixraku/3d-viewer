@@ -1,5 +1,46 @@
 # Progress
 
+## 2026-08-13 (branch `initial-model-viewer`) — egui menu bar and loading spinner
+
+Evaluated GPUI/gpui-component first: rejected because GPUI owns its own window and
+event loop, so its widgets cannot be drawn into a Bevy window. `paint_surface` is
+macOS-only (`gpui/src/window.rs`, `#[cfg(target_os = "macos")]`) and takes a
+`CVPixelBuffer`, which would force a GPU→CPU→GPU roundtrip per frame. Chose
+`bevy_egui` instead, which is built for overlaying UI on a Bevy scene.
+
+- Added `bevy_egui` 0.40.1 (not 0.41.1: `bevy_panorbit_camera` 0.35's `bevy_egui`
+  feature requires `^0.40`; mixing would pull two egui versions and silently break
+  `EguiWantsFocus`). `cargo tree -i egui` confirms a single egui 0.34.3.
+- Enabled `bevy_panorbit_camera`'s `bevy_egui` feature and set
+  `EguiFocusIncludesHover(true)` so hovering the menu bar does not orbit the camera.
+- New `draw_ui` system on `EguiPrimaryContextPass`: File menu (Open… / Quit) plus a
+  centered status overlay with `egui::Spinner` while loading.
+- New `OpenFileRequested` message decouples the trigger from the dialog. The `O`
+  shortcut and the menu item both write it; `open_file_dialog` reads it. Repeats
+  within a frame collapse to one dialog.
+- Removed the hand-rolled Bevy UI loading overlay: `LoadingPanel` / `LoadingText`
+  components and their spawn block. `sync_window_title_and_loading_ui` shrank to
+  `sync_window_title`; the label logic moved to `status_label`.
+- `Panel::show` is deprecated in egui 0.34, so the menu bar uses `show_inside` on a
+  background-layer `Ui` over `ctx.viewport_rect()` (same pattern as bevy_egui's
+  `side_panel` example).
+
+Verification: `cargo build`, `cargo build --features three-mf`, and
+`cargo clippy --all-targets` are clean (the one remaining warning is a pre-existing
+linker `__eh_frame` note from Bevy's debug binary size). `cargo test`: 6 passed,
+0 failed. Ran the binary against a test STL twice (~15s and ~12s), no panics; logs
+confirm `Model request complete` and `Mesh imported and normalized`.
+
+Confirmed interactively on 2026-08-14 via `cargo run` on macOS 26.2 / Apple M4 Pro
+(Metal): window opened, a GLB was loaded through the File menu
+(`Scene ready and normalized`, total 13415 ms), and the app exited cleanly. No panics
+or errors in the session log. Automated screenshot capture was not possible in this
+environment (`screencapture` reports `could not create image from display` — no
+screen-recording permission), so the check was done by the user.
+
+Remaining issues: `bevy_egui` logs a benign startup warning that bindless textures
+are unsupported on Metal and it is disabling bindless mode (bevyengine/bevy#18149).
+
 ## Unreleased — Auto-scale STL to consistent view size
 
 - STL has no unit metadata; raw coordinates can be millimeters, inches, or meters.

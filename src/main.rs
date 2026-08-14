@@ -18,9 +18,14 @@ use bevy::{
     window::{FileDragAndDrop, PrimaryWindow},
     world_serialization::WorldInstanceReady,
 };
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_obj::ObjPlugin;
-use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
+use bevy_panorbit_camera::{EguiFocusIncludesHover, PanOrbitCamera, PanOrbitCameraPlugin};
 use rfd::AsyncFileDialog;
+
+/// Sent when the user asks to open a file, either from the menu or the `O` shortcut.
+#[derive(Message)]
+struct OpenFileRequested;
 
 #[derive(Component)]
 struct LoadedModel;
@@ -36,12 +41,6 @@ struct ModelRequest {
     started_at: Option<Instant>,
     stage: LoadingStage,
 }
-
-#[derive(Component)]
-struct LoadingPanel;
-
-#[derive(Component)]
-struct LoadingText;
 
 #[derive(Default, PartialEq, Eq)]
 enum LoadingStatus {
@@ -107,26 +106,29 @@ fn main() {
         .add_plugins(ObjPlugin)
         .add_plugins(PanOrbitCameraPlugin)
         .add_plugins(InfiniteGridPlugin)
+        .add_plugins(EguiPlugin::default())
+        // The menu bar is a Panel, so hovering it must also block camera input.
+        .insert_resource(EguiFocusIncludesHover(true))
         .init_resource::<ModelRequest>()
+        .add_message::<OpenFileRequested>()
         .add_systems(Startup, setup)
         .add_systems(PostStartup, load_startup_model)
         .add_observer(mark_model_ready)
+        .add_systems(EguiPrimaryContextPass, draw_ui)
         .add_systems(
             Update,
             (
+                request_open_on_shortcut,
                 open_file_dialog,
                 poll_file_dialog,
                 handle_file_drop,
                 detect_asset_load_failures,
                 poll_mesh_import,
-                sync_window_title_and_loading_ui,
+                sync_window_title,
             )
                 .chain(),
         )
-        .add_systems(
-            PostStartup,
-            sync_window_title_and_loading_ui.after(load_startup_model),
-        )
+        .add_systems(PostStartup, sync_window_title.after(load_startup_model))
         .add_systems(
             PostUpdate,
             (
@@ -183,47 +185,11 @@ fn setup(mut commands: Commands) {
             scale: 1.0,
         },
     ));
-
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                width: percent(100),
-                height: percent(100),
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                ..default()
-            },
-            Visibility::Hidden,
-            LoadingPanel,
-        ))
-        .with_children(|parent| {
-            parent
-                .spawn((
-                    Node {
-                        padding: UiRect::axes(px(28), px(18)),
-                        border_radius: BorderRadius::all(px(12)),
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.04, 0.05, 0.07, 0.88)),
-                ))
-                .with_child((
-                    Text::new("Loading…"),
-                    TextFont {
-                        font_size: FontSize::Px(22.0),
-                        ..default()
-                    },
-                    TextColor(Color::WHITE),
-                    LoadingText,
-                ));
-        });
 }
 
-fn sync_window_title_and_loading_ui(
+fn sync_window_title(
     request: Res<ModelRequest>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
-    mut panels: Query<&mut Visibility, With<LoadingPanel>>,
-    mut texts: Query<&mut Text, With<LoadingText>>,
 ) {
     if !request.is_changed() {
         return;
@@ -235,26 +201,75 @@ fn sync_window_title_and_loading_ui(
             |file_name| format!("rust-model-viewer - {file_name}"),
         );
     }
+}
 
-    if let Ok(mut panel) = panels.single_mut() {
-        *panel = if request.status == LoadingStatus::Idle {
-            Visibility::Hidden
-        } else {
-            Visibility::Visible
-        };
+fn status_label(request: &ModelRequest) -> Option<&'static str> {
+    match request.status {
+        LoadingStatus::Idle => None,
+        LoadingStatus::Loading => Some(match request.stage {
+            LoadingStage::LoadingAsset => "Loading model…",
+            LoadingStage::SpawningScene => "Preparing scene…",
+            LoadingStage::FramingModel => "Framing model…",
+        }),
+        LoadingStatus::Failed => Some("Failed to load"),
+    }
+}
+
+fn draw_ui(
+    mut contexts: EguiContexts,
+    request: Res<ModelRequest>,
+    mut open_requests: MessageWriter<OpenFileRequested>,
+    mut exit: MessageWriter<AppExit>,
+) -> Result {
+    let ctx = contexts.ctx_mut()?;
+    let busy = request.status == LoadingStatus::Loading;
+
+    // Panels must be shown inside a Ui; build one over the whole viewport on the
+    // background layer so the 3D scene stays visible behind it.
+    let mut viewport_ui = egui::Ui::new(
+        ctx.clone(),
+        "viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
+    egui::Panel::top("menu_bar").show_inside(&mut viewport_ui, |ui| {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Open…").shortcut_text("O"))
+                    .clicked()
+                {
+                    open_requests.write(OpenFileRequested);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    exit.write(AppExit::Success);
+                    ui.close();
+                }
+            });
+        });
+    });
+
+    if let Some(label) = status_label(&request) {
+        egui::Area::new("status".into())
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if busy {
+                            ui.add(egui::Spinner::new().size(20.0));
+                        }
+                        ui.label(label);
+                    });
+                });
+            });
     }
 
-    if let Ok(mut text) = texts.single_mut() {
-        text.0 = match request.status {
-            LoadingStatus::Idle => String::new(),
-            LoadingStatus::Loading => match request.stage {
-                LoadingStage::LoadingAsset => "Loading model…".to_owned(),
-                LoadingStage::SpawningScene => "Preparing scene…".to_owned(),
-                LoadingStage::FramingModel => "Framing model…".to_owned(),
-            },
-            LoadingStatus::Failed => "Failed to load".to_owned(),
-        };
-    }
+    Ok(())
 }
 
 fn detect_asset_load_failures(
@@ -484,12 +499,22 @@ fn compute_world_aabb(
     (saw_mesh && min.is_finite() && max.is_finite()).then_some((min, max))
 }
 
-fn open_file_dialog(
+fn request_open_on_shortcut(
     keyboard: Res<ButtonInput<KeyCode>>,
+    mut open_requests: MessageWriter<OpenFileRequested>,
+) {
+    if keyboard.just_pressed(KeyCode::KeyO) {
+        open_requests.write(OpenFileRequested);
+    }
+}
+
+fn open_file_dialog(
+    mut open_requests: MessageReader<OpenFileRequested>,
     pending_tasks: Query<(), With<PickFileTask>>,
     mut commands: Commands,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyO) || !pending_tasks.is_empty() {
+    // Collapse repeats within a frame: one dialog at a time.
+    if open_requests.read().count() == 0 || !pending_tasks.is_empty() {
         return;
     }
 
